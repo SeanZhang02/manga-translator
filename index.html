@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Manga Live Translator · 4.7</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: #0a0a0a;
+    color: #e8e8e8;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    grid-template-rows: 56px 1fr;
+    overflow: hidden;
+  }
+  @media (max-width: 900px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 56px 1fr 180px; }
+    aside { border-left: none; border-top: 1px solid #222; }
+  }
+  header {
+    grid-column: 1 / -1;
+    background: #141414;
+    border-bottom: 1px solid #222;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 10px;
+    font-size: 13px;
+    overflow-x: auto;
+  }
+  header h1 {
+    font-size: 13px; font-weight: 600; color: #f5f5f5; white-space: nowrap;
+  }
+  header h1 small { color: #666; font-weight: 400; margin-left: 6px; }
+  header input, header select, header button {
+    background: #1d1d1d; color: #e8e8e8; border: 1px solid #333;
+    padding: 6px 10px; font-size: 12px; font-family: inherit; border-radius: 4px;
+  }
+  header input:focus, header select:focus { outline: 1px solid #2563eb; }
+  header button { cursor: pointer; transition: background 0.15s; white-space: nowrap; }
+  header button:hover:not(:disabled) { background: #2a2a2a; }
+  header button.primary { background: #2563eb; border-color: #2563eb; }
+  header button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  header button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .spacer { flex: 1; }
+  .inline {
+    font-size: 11px; color: #888;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .inline input { width: 56px; padding: 4px 6px; }
+  .status {
+    font-size: 12px; color: #aaa;
+    display: inline-flex; align-items: center; gap: 6px; padding: 0 8px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .dot.active { background: #22c55e; }
+  .dot.busy { background: #f59e0b; animation: pulse 1s infinite; }
+  .dot.error { background: #ef4444; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  main {
+    position: relative;
+    background: #000;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  video {
+    max-width: 100%; max-height: 100%;
+    width: auto; height: auto;
+    display: none;
+    background: #000;
+  }
+  #overlay { position: absolute; pointer-events: none; }
+  .bubble {
+    position: absolute;
+    background: rgba(255, 248, 232, 0.95);
+    color: #111;
+    border: 2px solid #1a1a1a;
+    border-radius: 8px;
+    padding: 3px 6px;
+    font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+    font-weight: 500;
+    line-height: 1.2;
+    overflow: hidden;
+    word-break: break-word;
+    white-space: pre-wrap;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    animation: fadeIn 0.25s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+
+  .toast {
+    position: absolute;
+    top: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(20, 20, 20, 0.9);
+    color: #e8e8e8;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    border: 1px solid #333;
+    backdrop-filter: blur(6px);
+    pointer-events: none;
+    z-index: 10;
+    animation: toastIn 0.3s ease, toastOut 0.3s ease 2.5s forwards;
+  }
+  .toast.info  { border-color: #2563eb; }
+  .toast.warn  { border-color: #f59e0b; }
+  .toast.err   { border-color: #ef4444; color: #fca5a5; }
+  @keyframes toastIn  { from { opacity: 0; transform: translate(-50%, -10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+  @keyframes toastOut { to { opacity: 0; transform: translate(-50%, -10px); } }
+
+  .empty-state {
+    color: #777;
+    font-size: 14px;
+    text-align: center;
+    padding: 40px;
+    line-height: 1.8;
+    max-width: 580px;
+  }
+  .empty-state .head { font-size: 17px; color: #aaa; margin-bottom: 18px; }
+  .empty-state code {
+    background: #181818; padding: 2px 6px; border-radius: 3px;
+    color: #93c5fd; font-family: Consolas, monospace; font-size: 13px;
+  }
+  .empty-state .note {
+    margin-top: 22px; color: #555; font-size: 12px;
+    border-top: 1px solid #1a1a1a; padding-top: 16px; text-align: left;
+  }
+  .empty-state .note b { color: #888; }
+  .empty-state .warn {
+    color: #fbbf24; font-size: 12px; margin-top: 16px;
+    background: rgba(251, 191, 36, 0.08); padding: 10px; border-radius: 4px;
+    border: 1px solid rgba(251, 191, 36, 0.2);
+  }
+
+  aside {
+    background: #0f0f0f;
+    border-left: 1px solid #222;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  aside h2 {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    color: #666; letter-spacing: 0.08em;
+    padding: 12px 16px 6px;
+  }
+  .stats {
+    padding: 4px 16px 14px;
+    font-size: 11px;
+    color: #888;
+    line-height: 1.8;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  .stats .val { color: #e8e8e8; font-variant-numeric: tabular-nums; }
+  .stats .err-val { color: #ef4444; }
+  .events {
+    flex: 1; overflow-y: auto;
+    padding: 6px 12px 12px;
+    font-family: Consolas, "Cascadia Code", monospace;
+    font-size: 11px; line-height: 1.55;
+  }
+  .events div {
+    padding: 3px 0;
+    border-bottom: 1px solid #161616;
+    color: #a0a0a0;
+    word-break: break-word;
+  }
+  .events .info { color: #a0a0a0; }
+  .events .ok   { color: #4ade80; }
+  .events .warn { color: #fbbf24; }
+  .events .err  { color: #f87171; }
+  .events .ts   { color: #555; margin-right: 6px; }
+
+  canvas.hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Manga Live Translator <small>· 4.7</small></h1>
+  <input type="password" id="key" placeholder="sk-ant-..." size="26" autocomplete="off">
+  <select id="model" title="Model">
+    <option value="claude-opus-4-7">Opus 4.7</option>
+    <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+  </select>
+  <label class="inline" title="How often to sample the screen (ms)">
+    poll <input type="number" id="poll" value="1500" min="400" max="8000" step="100">
+  </label>
+  <label class="inline" title="Hash diff % for page-change">
+    diff <input type="number" id="threshold" value="15" min="1" max="50" step="1">%
+  </label>
+  <label class="inline" title="Consecutive stable ticks needed to trigger">
+    stable <input type="number" id="stableN" value="3" min="1" max="8" step="1">
+  </label>
+  <div class="spacer"></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="state">idle</span></div>
+  <button id="start" class="primary">Pick window / screen</button>
+  <button id="stop" disabled>Stop</button>
+</header>
+
+<main id="main">
+  <div class="empty-state" id="empty">
+    <div class="head">实时日漫翻译原型 · Opus 4.7 vision</div>
+    <div>
+      ① 填 Anthropic API key（localStorage 保存，仅本机）<br>
+      ② 点 <code>Pick window / screen</code>，选你看漫画的窗口<br>
+      ③ 连续 <code>stable</code> 个采样都稳定（默认 3 × 1.5s ≈ 4.5s）触发识别+翻译<br>
+      ④ Claude 4.7 返回日中对照 + 像素 bbox → 叠在原气泡位置
+    </div>
+    <div class="note">
+      <b>页面翻译的逻辑</b><br>
+      · 16×16 average-hash 每 <code>poll</code> ms 采样<br>
+      · 翻页 → diff 超 <code>diff%</code> → 重置计数<br>
+      · 连续 <code>stable</code> 个采样稳定 → 翻译（webtoon 滚动不会乱烧钱）<br>
+      · 翻译期间若画面又变 → 旧结果 <b>discard</b>，不会错位叠加<br>
+      · 3 次连续错误自动暂停，可重新 Start 恢复<br><br>
+      <b>成本</b><br>
+      · Opus 4.7 单页 ≈ $0.01–0.03（按 2576px 图计）<br>
+      · Sonnet 4.6 ≈ Opus 的 1/2，bbox 精度稍差<br>
+      · 右侧面板实时显示 token + 估算花费
+    </div>
+    <div class="warn" id="file-warn"></div>
+  </div>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="overlay"></div>
+</main>
+
+<aside>
+  <h2>Stats</h2>
+  <div class="stats">
+    Frames sampled: <span class="val" id="stat-frames">0</span><br>
+    Page changes: <span class="val" id="stat-changes">0</span><br>
+    Translations: <span class="val" id="stat-trans">0</span><br>
+    Discarded (stale): <span class="val" id="stat-discard">0</span><br>
+    Tokens in / out: <span class="val" id="stat-tokens">0 / 0</span><br>
+    Cost estimate: $<span class="val" id="stat-cost">0.0000</span><br>
+    Last error: <span class="val err-val" id="stat-err">none</span>
+  </div>
+  <h2>Event log</h2>
+  <div class="events" id="events"></div>
+</aside>
+
+<canvas id="canvas" class="hidden"></canvas>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  key: $('key'), model: $('model'), poll: $('poll'), threshold: $('threshold'), stableN: $('stableN'),
+  start: $('start'), stop: $('stop'),
+  video: $('video'), canvas: $('canvas'), overlay: $('overlay'), empty: $('empty'),
+  main: $('main'),
+  dot: $('dot'), state: $('state'),
+  events: $('events'), fileWarn: $('file-warn'),
+  frames: $('stat-frames'), changes: $('stat-changes'), trans: $('stat-trans'),
+  discard: $('stat-discard'), tokens: $('stat-tokens'), cost: $('stat-cost'), err: $('stat-err'),
+};
+
+// ---- Persisted UI state ----
+const PERSIST = ['key','model','poll','threshold','stableN'];
+for (const k of PERSIST) {
+  const saved = localStorage.getItem('mt-' + k);
+  if (saved !== null) els[k].value = saved;
+  els[k].addEventListener('change', () => localStorage.setItem('mt-' + k, els[k].value));
+}
+
+// ---- file:// origin warning ----
+if (location.protocol === 'file:') {
+  els.fileWarn.textContent = '⚠ 你在 file:// 打开，某些浏览器的 CORS 可能会阻止 API 调用。如果 translate 直接报 CORS/network error，改用 http://localhost 访问。在终端 cd 到本文件目录执行:  python -m http.server 8080  然后打开 http://localhost:8080';
+}
+
+// ---- Runtime state ----
+let stream = null;
+let loopActive = false;
+let busy = false;
+let lastHash = null;
+let stableTickCount = 0;
+let pageEpoch = 0;            // increments when stable state is broken (new page)
+let lastRenderedEpoch = -1;   // which epoch is currently on screen
+let lastTranslateAt = 0;
+let consecutiveErrors = 0;
+let frameCount = 0, changeCount = 0, transCount = 0, discardCount = 0;
+let totalIn = 0, totalOut = 0;
+let currentBubbles = [];
+let lastImageDims = { w: 0, h: 0 };
+let resizeDebounce = null;
+let toastTimer = null;
+
+// Pricing per million tokens. Image tokens bill at input rate per Anthropic pricing.
+const PRICE = {
+  'claude-opus-4-7':   { in: 5.00,  out: 25.00 },
+  'claude-sonnet-4-6': { in: 3.00,  out: 15.00 },
+};
+
+function setState(text, kind) {
+  els.state.textContent = text;
+  els.dot.className = 'dot ' + (kind === 'busy' ? 'busy' : kind === 'err' ? 'error' : kind === 'active' ? 'active' : '');
+  // Reflect state in document title for background-tab awareness
+  const prefix = kind === 'busy' ? '⏳ ' : kind === 'err' ? '⚠ ' : kind === 'active' ? '● ' : '';
+  document.title = prefix + 'Manga Live Translator · 4.7';
+}
+
+function log(msg, level) {
+  level = level || 'info';
+  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const div = document.createElement('div');
+  div.className = level;
+  const tsEl = document.createElement('span'); tsEl.className = 'ts'; tsEl.textContent = ts;
+  div.appendChild(tsEl);
+  div.appendChild(document.createTextNode(msg));
+  els.events.insertBefore(div, els.events.firstChild);
+  while (els.events.children.length > 200) els.events.lastChild.remove();
+  if (level === 'err') {
+    els.err.textContent = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  }
+}
+
+function toast(msg, kind) {
+  const existing = els.main.querySelector('.toast');
+  if (existing) existing.remove();
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  const t = document.createElement('div');
+  t.className = 'toast ' + (kind || 'info');
+  t.textContent = msg;
+  els.main.appendChild(t);
+  toastTimer = setTimeout(() => t.remove(), 3000);
+}
+
+// ---- Average-hash perceptual fingerprint (16x16 gray) ----
+const hashCtx = (() => {
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 16;
+  return c.getContext('2d', { willReadFrequently: true });
+})();
+function avgHash(sourceCanvas) {
+  hashCtx.drawImage(sourceCanvas, 0, 0, 16, 16);
+  const data = hashCtx.getImageData(0, 0, 16, 16).data;
+  const gray = new Float32Array(256);
+  let sum = 0;
+  for (let i = 0; i < 256; i++) {
+    const g = (data[i*4] + data[i*4+1] + data[i*4+2]) / 3;
+    gray[i] = g; sum += g;
+  }
+  const avg = sum / 256;
+  const bits = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) bits[i] = gray[i] > avg ? 1 : 0;
+  return bits;
+}
+function hashDiff(a, b) {
+  if (!a || !b || a.length !== b.length) return 1;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
+  return diff / a.length;
+}
+
+// ---- Capture lifecycle ----
+async function startCapture() {
+  const key = els.key.value.trim();
+  if (!key) { log('Fill API key first.', 'err'); toast('请先填入 API key', 'err'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    log('Browser lacks getDisplayMedia. Use latest Chrome/Edge/Firefox on desktop.', 'err');
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 4 },
+      audio: false,
+    });
+  } catch (e) {
+    log('Screen capture cancelled/failed: ' + e.message, 'warn');
+    return;
+  }
+  els.video.srcObject = stream;
+  try {
+    await new Promise((res, rej) => {
+      els.video.onloadedmetadata = res;
+      setTimeout(() => rej(new Error('video metadata timeout')), 5000);
+    });
+    await els.video.play().catch((e) => { log('video.play rejected: ' + e.message, 'warn'); });
+  } catch (e) {
+    log('Video init failed: ' + e.message, 'err');
+    stopCapture(); return;
+  }
+  els.empty.style.display = 'none';
+  els.video.style.display = 'block';
+  els.start.disabled = true;
+  els.stop.disabled = false;
+  setState('watching', 'active');
+  log('Capture started: ' + els.video.videoWidth + '×' + els.video.videoHeight, 'ok');
+
+  stream.getVideoTracks()[0].addEventListener('ended', () => {
+    log('Screen share ended by user', 'warn');
+    stopCapture();
+  });
+
+  // Reset runtime state
+  loopActive = true;
+  lastHash = null; stableTickCount = 0;
+  pageEpoch = 0; lastRenderedEpoch = -1;
+  consecutiveErrors = 0;
+  loop();
+}
+
+function stopCapture() {
+  loopActive = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  els.video.srcObject = null;
+  els.video.style.display = 'none';
+  els.empty.style.display = 'block';
+  els.start.disabled = false;
+  els.stop.disabled = true;
+  busy = false;
+  setState('idle', 'idle');
+  clearOverlay();
+  log('Stopped.', 'info');
+}
+
+async function loop() {
+  while (loopActive) {
+    const interval = Math.max(400, parseInt(els.poll.value) || 1500);
+    try { await tick(); }
+    catch (e) { log('Tick error: ' + e.message, 'err'); }
+    await new Promise(r => setTimeout(r, interval));
+  }
+}
+
+async function tick() {
+  if (!stream) return;
+  const v = els.video;
+  if (!v.videoWidth || v.readyState < 2) return;
+
+  // Capture frame, capped at 2576 long edge (Opus 4.7 high-res ceiling).
+  const MAX = 2576;
+  let w = v.videoWidth, h = v.videoHeight;
+  const longEdge = Math.max(w, h);
+  if (longEdge > MAX) {
+    const s = MAX / longEdge;
+    w = Math.round(w * s); h = Math.round(h * s);
+  }
+  if (els.canvas.width !== w)  els.canvas.width  = w;
+  if (els.canvas.height !== h) els.canvas.height = h;
+  const ctx = els.canvas.getContext('2d');
+  ctx.drawImage(v, 0, 0, w, h);
+  lastImageDims = { w, h };
+  frameCount++;
+  els.frames.textContent = frameCount;
+
+  const hash = avgHash(els.canvas);
+  const threshold = Math.max(0.01, (parseInt(els.threshold.value) || 15) / 100);
+
+  // ---- state machine ----
+  // Important: update hash state EVEN when busy, so mid-translate flips are observed.
+  if (lastHash === null) {
+    lastHash = hash;
+    stableTickCount = 1;
+    return;
+  }
+
+  const diff = hashDiff(lastHash, hash);
+  if (diff > threshold) {
+    // Unstable: if we were previously stable (count>=N), a translation may be in flight
+    // and the page has moved → bump epoch so that translation is discarded on return.
+    const needN = Math.max(1, parseInt(els.stableN.value) || 3);
+    if (stableTickCount >= needN) {
+      pageEpoch++;
+      // Stale overlay on new page is worse than blank — clear immediately on flip.
+      if (currentBubbles.length) clearOverlay();
+    }
+    stableTickCount = 0;
+    lastHash = hash;
+    return;
+  }
+
+  // Stable (diff <= threshold)
+  stableTickCount++;
+  lastHash = hash;
+
+  if (busy) return; // state updated, but don't launch another call
+
+  const needN = Math.max(1, parseInt(els.stableN.value) || 3);
+  if (stableTickCount >= needN && lastRenderedEpoch !== pageEpoch) {
+    // Rate limit: at least 2.5s between translate completions
+    const sinceLast = Date.now() - lastTranslateAt;
+    if (lastTranslateAt && sinceLast < 2500) {
+      // Don't consume the stability window; just wait and try again next tick.
+      return;
+    }
+    changeCount++;
+    els.changes.textContent = changeCount;
+    log('Stable for ' + needN + ' ticks → translate (epoch ' + pageEpoch + ')', 'ok');
+    await translate(pageEpoch);
+  }
+}
+
+function classifyError(status, bodyText) {
+  // Returns { hard: bool, message: string, backoffMs: number }
+  if (status === 401 || status === 403) {
+    return { hard: true, message: 'Auth error — check your API key (starts with sk-ant-)', backoffMs: 0 };
+  }
+  if (status === 400) {
+    // Parse for specific errors
+    const isSize = bodyText.includes('exceed') || bodyText.includes('too large') || bodyText.includes('image');
+    return { hard: true, message: isSize ? '400: image too large or invalid (try Sonnet or lower resolution)' : '400: ' + bodyText.slice(0, 120), backoffMs: 0 };
+  }
+  if (status === 429) {
+    return { hard: false, message: '429: rate-limited, backing off 20s', backoffMs: 20000 };
+  }
+  if (status === 529) {
+    return { hard: false, message: '529: Anthropic overloaded, retry in 15s', backoffMs: 15000 };
+  }
+  if (status >= 500) {
+    return { hard: false, message: status + ': server error, retry in 10s', backoffMs: 10000 };
+  }
+  return { hard: false, message: 'HTTP ' + status, backoffMs: 5000 };
+}
+
+async function translate(myEpoch) {
+  busy = true;
+  setState('translating', 'busy');
+
+  const key = els.key.value.trim();
+  const model = els.model.value;
+  let backoffMs = 0;
+
+  try {
+    // JPEG @ 0.85 — much smaller than PNG, still readable for vision
+    const dataUrl = els.canvas.toDataURL('image/jpeg', 0.85);
+    const mediaType = dataUrl.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
+    const base64 = dataUrl.split(',')[1];
+    // Byte-size sanity (base64 is ~1.37× raw)
+    const approxMB = (base64.length * 0.75) / (1024 * 1024);
+    if (approxMB > 4.8) {
+      log('Image ' + approxMB.toFixed(1) + 'MB near 5MB limit; consider lowering resolution', 'warn');
+    }
+
+    const t0 = performance.now();
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 6000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+            { type: 'text', text:
+`这是一页日语漫画截图，尺寸 ${lastImageDims.w}×${lastImageDims.h} 像素，坐标原点左上角。
+
+识别所有含日语文字的区域（对话气泡、旁白框、拟声词、招牌、标签、思考泡泡等）。每个区域输出：
+1. "text_jp": 日语原文（保留换行；竖排读法 = 自上而下、右列先读；忽略 furigana 小假名）
+2. "text_zh": 自然流畅的中文翻译（拟声词翻成中文拟声词，例 ドキドキ→怦怦 / バタン→砰）
+3. "bbox": [x_min, y_min, x_max, y_max]，整数像素坐标，紧贴该文字框的视觉边界
+
+**严格输出 JSON array，不要 markdown 代码块，不要任何解释文字。**
+格式: [{"text_jp":"...","text_zh":"...","bbox":[x1,y1,x2,y2]}, ...]
+没有日语文字时返回 []。
+忽略 UI 元素：菜单栏、按钮、URL、时间戳、页码、page number、系统时钟。
+kanji + furigana 合并为同一个 bbox，不要拆开。` }
+          ]
+        }]
+      })
+    });
+
+    const elapsed = (performance.now() - t0) / 1000;
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      const cls = classifyError(resp.status, body);
+      log(cls.message, 'err');
+      if (cls.hard) {
+        consecutiveErrors = 99; // force hard stop
+      } else {
+        backoffMs = cls.backoffMs;
+        consecutiveErrors++;
+      }
+      return;
+    }
+
+    let data;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      log('Server returned non-JSON (status ' + resp.status + '): ' + e.message, 'err');
+      consecutiveErrors++;
+      return;
+    }
+
+    const inTok  = data.usage && data.usage.input_tokens  || 0;
+    const outTok = data.usage && data.usage.output_tokens || 0;
+    totalIn += inTok; totalOut += outTok;
+    els.tokens.textContent = totalIn.toLocaleString() + ' / ' + totalOut.toLocaleString();
+    const p = PRICE[model] || PRICE['claude-opus-4-7'];
+    const cost = (totalIn * p.in + totalOut * p.out) / 1e6;
+    els.cost.textContent = cost.toFixed(4);
+
+    if (data.stop_reason === 'max_tokens') {
+      log('Response truncated at max_tokens; translations may be incomplete', 'warn');
+    }
+
+    let textBlock = (data.content || [])
+      .filter(c => c.type === 'text')
+      .map(c => c.text)
+      .join('\n')
+      .trim();
+    textBlock = textBlock.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    // Clip to outermost [...] if there's preamble/postamble
+    const firstBracket = textBlock.indexOf('[');
+    const lastBracket  = textBlock.lastIndexOf(']');
+    if (firstBracket >= 0 && lastBracket > firstBracket) {
+      textBlock = textBlock.slice(firstBracket, lastBracket + 1);
+    }
+
+    let bubbles = [];
+    try {
+      const parsed = JSON.parse(textBlock);
+      if (Array.isArray(parsed)) bubbles = parsed;
+      else if (parsed && Array.isArray(parsed.bubbles)) bubbles = parsed.bubbles;
+    } catch (e) {
+      log('Bad JSON: ' + textBlock.slice(0, 80), 'err');
+      consecutiveErrors++;
+      return;
+    }
+
+    // Sanity-filter bboxes
+    const imgArea = lastImageDims.w * lastImageDims.h || 1;
+    bubbles = bubbles.filter(b => {
+      if (!b || !Array.isArray(b.bbox) || b.bbox.length !== 4) return false;
+      let [x1, y1, x2, y2] = b.bbox.map(Number);
+      if (![x1,y1,x2,y2].every(n => Number.isFinite(n))) return false;
+      if (x2 <= x1 || y2 <= y1) return false;
+      if (x1 < 0 || y1 < 0) return false;
+      if (x2 > lastImageDims.w * 1.05 || y2 > lastImageDims.h * 1.05) return false;
+      // Clamp to image
+      x1 = Math.max(0, x1); y1 = Math.max(0, y1);
+      x2 = Math.min(lastImageDims.w, x2); y2 = Math.min(lastImageDims.h, y2);
+      if (x2 - x1 < 4 || y2 - y1 < 4) return false; // too tiny after clamp
+      // Reject near-full-frame hallucinations (>70% of image area)
+      if (((x2-x1) * (y2-y1)) / imgArea > 0.7) return false;
+      if (!b.text_zh || typeof b.text_zh !== 'string' || !b.text_zh.trim()) return false;
+      b.bbox = [x1, y1, x2, y2];
+      return true;
+    });
+
+    transCount++;
+    els.trans.textContent = transCount;
+    consecutiveErrors = 0;
+    log('Got ' + bubbles.length + ' bubble(s) in ' + elapsed.toFixed(1) + 's (epoch ' + myEpoch + ', in:' + inTok + ' out:' + outTok + ')', 'ok');
+
+    // Epoch check — if page changed during translation, discard
+    if (myEpoch !== pageEpoch) {
+      discardCount++;
+      els.discard.textContent = discardCount;
+      log('Page moved during translate (epoch ' + myEpoch + '→' + pageEpoch + '), discarding render.', 'warn');
+      toast('翻页太快，旧结果已丢弃', 'warn');
+      return;
+    }
+    if (!loopActive) {
+      log('Loop stopped during translate, skipping render.', 'info');
+      return;
+    }
+
+    lastRenderedEpoch = myEpoch;
+    currentBubbles = bubbles;
+    renderOverlay();
+
+    if (bubbles.length === 0) {
+      toast('未检测到日语文字', 'info');
+    }
+  } catch (e) {
+    log('Translate failed: ' + e.message, 'err');
+    consecutiveErrors++;
+  } finally {
+    busy = false;
+    lastTranslateAt = Date.now();
+    if (loopActive) {
+      if (consecutiveErrors >= 3) {
+        log('3 consecutive errors — pausing. Fix the issue and click Start to resume.', 'err');
+        loopActive = false;
+        els.start.disabled = false;
+        els.stop.disabled = true;
+        setState('paused (error)', 'err');
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; els.video.srcObject = null; }
+        els.video.style.display = 'none';
+        els.empty.style.display = 'block';
+      } else {
+        setState('watching', 'active');
+        if (backoffMs > 0) {
+          log('Backing off ' + (backoffMs/1000) + 's…', 'warn');
+          setState('backoff', 'busy');
+          await new Promise(r => setTimeout(r, backoffMs));
+          if (loopActive) setState('watching', 'active');
+        }
+      }
+    }
+  }
+}
+
+function clearOverlay() {
+  els.overlay.innerHTML = '';
+  currentBubbles = [];
+}
+
+function renderOverlay() {
+  els.overlay.innerHTML = '';
+  if (!currentBubbles.length || !lastImageDims.w || !lastImageDims.h) return;
+
+  const v = els.video;
+  if (v.style.display === 'none') return;
+  const vRect    = v.getBoundingClientRect();
+  const mainRect = els.overlay.parentElement.getBoundingClientRect();
+  if (!vRect.width || !vRect.height) return;
+
+  const offsetLeft = vRect.left - mainRect.left;
+  const offsetTop  = vRect.top  - mainRect.top;
+  els.overlay.style.left   = offsetLeft + 'px';
+  els.overlay.style.top    = offsetTop  + 'px';
+  els.overlay.style.width  = vRect.width  + 'px';
+  els.overlay.style.height = vRect.height + 'px';
+
+  const sx = vRect.width  / lastImageDims.w;
+  const sy = vRect.height / lastImageDims.h;
+
+  // Sort bubbles by area desc so larger ones render behind smaller ones
+  const sorted = [...currentBubbles].sort((a, b) => {
+    const areaA = (a.bbox[2]-a.bbox[0]) * (a.bbox[3]-a.bbox[1]);
+    const areaB = (b.bbox[2]-b.bbox[0]) * (b.bbox[3]-b.bbox[1]);
+    return areaB - areaA;
+  });
+
+  for (const b of sorted) {
+    const [x1, y1, x2, y2] = b.bbox;
+    const w = (x2 - x1) * sx;
+    const h = (y2 - y1) * sy;
+    if (w < 8 || h < 8) continue;
+    const div = document.createElement('div');
+    div.className = 'bubble';
+    div.style.left   = (x1 * sx) + 'px';
+    div.style.top    = (y1 * sy) + 'px';
+    div.style.width  = w + 'px';
+    div.style.height = h + 'px';
+    // Font size heuristic: account for aspect ratio
+    const chars = [...b.text_zh].length || 1;
+    const area = w * h;
+    let fs = Math.sqrt(area / chars) * 0.9;
+    // Clamp by char count (short text shouldn't become huge)
+    const charCap = chars <= 2 ? 22 : chars <= 6 ? 28 : 26;
+    fs = Math.max(10, Math.min(fs, charCap));
+    div.style.fontSize = fs.toFixed(1) + 'px';
+    div.textContent = b.text_zh;
+    if (b.text_jp) div.title = b.text_jp + '\n\n→ ' + b.text_zh;
+    els.overlay.appendChild(div);
+  }
+}
+
+// Debounced re-render on resize
+window.addEventListener('resize', () => {
+  if (resizeDebounce) clearTimeout(resizeDebounce);
+  resizeDebounce = setTimeout(renderOverlay, 80);
+});
+els.video.addEventListener('loadedmetadata', renderOverlay);
+els.video.addEventListener('play', renderOverlay);
+
+els.start.addEventListener('click', startCapture);
+els.stop.addEventListener('click', stopCapture);
+
+// Keyboard: Space to toggle, Esc to stop
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { e.preventDefault(); if (stream) stopCapture(); else startCapture(); }
+  else if (e.key === 'Escape' && stream) stopCapture();
+});
+
+setState('idle', 'idle');
+log('Ready. Fill API key, click "Pick window / screen". (Space toggles, Esc stops.)', 'info');
+</script>
+</body>
+</html>
