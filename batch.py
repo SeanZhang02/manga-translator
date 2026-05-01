@@ -944,7 +944,7 @@ class BatchWindow(QMainWindow):
     def _on_start(self) -> None:
         self._pull_ui_to_cfg()
 
-        if not self.cfg["api_key"]:
+        if self.cfg["backend"] == "claude" and not self.cfg["api_key"]:
             self._on_log("API key missing.", "err"); return
         in_dir = Path(self.cfg["input_dir"])
         out_dir = Path(self.cfg["output_dir"])
