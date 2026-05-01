@@ -275,6 +275,10 @@ def call_ollama(
                 "prompt": prompt,
                 "images": [b64],
                 "stream": False,
+                "think": False,  # gemma4 has thinking capability; with thinking on,
+                                 # the 6000-token budget is eaten by reasoning and
+                                 # `response` comes back empty. Disable to go
+                                 # straight to JSON output.
                 "options": {"temperature": 0.2, "num_predict": 6000},
             }
             req = urllib.request.Request(
