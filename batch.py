@@ -287,6 +287,14 @@ def call_ollama(
                 data = json.load(resp)
 
             raw_text = (data.get("response") or "").strip()
+            if not raw_text:
+                done_reason = data.get("done_reason", "?")
+                eval_count = data.get("eval_count", 0)
+                prompt_eval = data.get("prompt_eval_count", 0)
+                raise ValueError(
+                    f"empty response (done_reason={done_reason}, "
+                    f"eval_count={eval_count}, prompt_eval={prompt_eval})"
+                )
             text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
             first = text.find("[")
@@ -575,11 +583,14 @@ class BatchWorker(QObject):
         # Ollama runs on one GPU; let the user's concurrency through but be aware
         # that ollama serializes internally unless OLLAMA_NUM_PARALLEL is tuned.
         concurrency = max(1, int(self.cfg.get("concurrency", 3)))
-        if backend == "ollama" and concurrency > 2:
+        if backend == "ollama" and concurrency > 1:
             self.log_message.emit(
-                f"Concurrency={concurrency} with ollama — will be queued "
-                f"serially by default (set OLLAMA_NUM_PARALLEL env for real parallelism).",
+                f"Ollama backend: capping concurrency {concurrency}→1 "
+                f"(single GPU + 17GB model serializes anyway; parallel requests "
+                f"cause timeouts and empty responses).",
                 "warn")
+            concurrency = 1
+        max_passes = max(1, int(self.cfg.get("auto_retry_passes", 3)))
 
         def process_one(path: Path) -> str:
             if self.stop_requested:
@@ -626,44 +637,76 @@ class BatchWorker(QObject):
             return f"{len(bubbles)} bubbles ({dt:.1f}s)"
 
         self.log_message.emit(
-            f"Starting batch: {self._total} files, {concurrency} parallel, model={model}",
+            f"Starting batch: {self._total} files, {concurrency} parallel, "
+            f"model={model}, auto-retry passes={max_passes}",
             "ok"
         )
 
-        with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            future_map = {ex.submit(process_one, f): f for f in files}
-            try:
-                for fut in as_completed(future_map):
-                    path = future_map[fut]
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        result = f"err: {e}"
+        remaining = list(files)
 
-                    with self._lock:
-                        if result == "skipped":
-                            self._skipped += 1
-                            lvl = "info"
-                        elif result.startswith("err:") or result == "cancelled":
-                            self._failed += 1
-                            lvl = "err"
-                        else:
-                            self._done += 1
-                            lvl = "ok"
-                        counts = (self._done, self._skipped, self._failed, self._total)
+        for pass_num in range(1, max_passes + 1):
+            if not remaining or self.stop_requested:
+                break
 
-                    idx = counts[0] + counts[1] + counts[2]
-                    self.log_message.emit(f"[{idx}/{self._total}] {path.name}: {result}", lvl)
-                    self.progress.emit(*counts)
-                    self._emit_stats()
+            if pass_num > 1:
+                # These files were counted as failed in the previous pass —
+                # un-count them so the cumulative _failed reflects only the
+                # files that fail the FINAL pass.
+                with self._lock:
+                    self._failed = max(0, self._failed - len(remaining))
+                self.log_message.emit(
+                    f"Auto-retry pass {pass_num}/{max_passes}: "
+                    f"{len(remaining)} files still pending",
+                    "warn")
+                self.progress.emit(self._done, self._skipped, self._failed, self._total)
 
-                    if self.stop_requested:
-                        # Cancel pending futures (already-running keep going)
-                        for f_obj in future_map:
-                            f_obj.cancel()
-                        break
-            except KeyboardInterrupt:
-                self.stop_requested = True
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                future_map = {ex.submit(process_one, f): f for f in remaining}
+                try:
+                    for fut in as_completed(future_map):
+                        path = future_map[fut]
+                        try:
+                            result = fut.result()
+                        except Exception as e:
+                            result = f"err: {e}"
+
+                        with self._lock:
+                            if result == "skipped":
+                                self._skipped += 1
+                                lvl = "info"
+                            elif result.startswith("err:") or result == "cancelled":
+                                self._failed += 1
+                                lvl = "err"
+                            else:
+                                self._done += 1
+                                lvl = "ok"
+                            counts = (self._done, self._skipped, self._failed, self._total)
+
+                        idx = counts[0] + counts[1] + counts[2]
+                        tag = f"[{idx}/{self._total}]" if pass_num == 1 else f"[retry {pass_num}]"
+                        self.log_message.emit(f"{tag} {path.name}: {result}", lvl)
+                        self.progress.emit(*counts)
+                        self._emit_stats()
+
+                        if self.stop_requested:
+                            for f_obj in future_map:
+                                f_obj.cancel()
+                            break
+                except KeyboardInterrupt:
+                    self.stop_requested = True
+
+            # Re-collect files that still have no output → next-pass candidates
+            remaining = [
+                f for f in remaining
+                if not (out_dir / (f.stem + ext)).exists()
+            ]
+
+        if remaining and not self.stop_requested:
+            self.log_message.emit(
+                f"{len(remaining)} files failed after {max_passes} passes: "
+                f"{', '.join(p.name for p in remaining[:5])}"
+                f"{' …' if len(remaining) > 5 else ''}",
+                "err")
 
         elapsed = time.time() - self._start_time
         self.log_message.emit(
