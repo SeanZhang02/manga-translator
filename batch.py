@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from anthropic import Anthropic, APIStatusError
 
 try:
@@ -224,6 +224,60 @@ def _dedup_bubbles(bubbles: List[Dict], iou_thresh: float = 0.4,
     return kept
 
 
+def detect_bubble_and_refine(
+    orig_img: Image.Image,
+    bbox: List[int],
+    pad: int = 6,
+    white_thresh: int = 230,
+    white_ratio_min: float = 0.40,
+    dark_thresh: int = 100,
+) -> Tuple[bool, List[int]]:
+    """Snap Gemma's approximate bbox to the actual JP text region inside a bubble.
+
+    Strategy:
+    1. Crop a slightly expanded region around bbox.
+    2. Histogram check — if region is mostly white (≥ white_ratio_min),
+       it's a bubble interior. Otherwise it's SFX / free-form text on art.
+    3. For bubbles: threshold dark pixels (= JP text), erode 1px to drop
+       thin bubble borders, take getbbox() for tight text bound.
+    4. Sanity check refined bbox isn't wildly different from original.
+
+    Returns (is_bubble, refined_bbox). is_bubble=True signals the caller
+    can also white-fill to erase the original JP text.
+    """
+    iw, ih = orig_img.size
+    x1, y1, x2, y2 = bbox
+    cx1 = max(0, x1 - pad)
+    cy1 = max(0, y1 - pad)
+    cx2 = min(iw, x2 + pad)
+    cy2 = min(ih, y2 + pad)
+    if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+        return False, bbox
+
+    crop = orig_img.crop((cx1, cy1, cx2, cy2)).convert("L")
+    hist = crop.histogram()
+    total = max(1, sum(hist))
+    white_ratio = sum(hist[white_thresh:]) / total
+    if white_ratio < white_ratio_min:
+        return False, bbox  # SFX or text on art — leave as-is
+
+    dark_mask = crop.point(lambda v: 255 if v < dark_thresh else 0)
+    # Erode 1px to discard thin bubble border lines, keep thicker text strokes
+    dark_mask = dark_mask.filter(ImageFilter.MinFilter(3))
+    text_bbox = dark_mask.getbbox()
+    if text_bbox is None:
+        return True, bbox  # bubble detected but no clear text — keep original
+
+    tx1, ty1, tx2, ty2 = text_bbox
+    refined = [cx1 + tx1, cy1 + ty1, cx1 + tx2, cy1 + ty2]
+
+    orig_area = max(1, (x2 - x1) * (y2 - y1))
+    new_area = (refined[2] - refined[0]) * (refined[3] - refined[1])
+    if new_area < orig_area * 0.15 or new_area > orig_area * 2.5:
+        return True, bbox  # refinement looks wrong; keep original but still erase
+    return True, refined
+
+
 def render_bubbles_on_image(
     img: Image.Image,
     bubbles: List[Dict],
@@ -232,12 +286,25 @@ def render_bubbles_on_image(
 ) -> Image.Image:
     out = img.copy().convert("RGB")
     draw = ImageDraw.Draw(out)
+    iw, ih = out.size
     sorted_b = sorted(
         bubbles,
         key=lambda b: -((b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1])),
     )
     for b in sorted_b:
-        x1, y1, x2, y2 = b["bbox"]
+        is_bubble, render_bbox = detect_bubble_and_refine(img, b["bbox"])
+        x1, y1, x2, y2 = render_bbox
+
+        if is_bubble:
+            # Erase original JP text underneath. Expand fill 4% so we cover
+            # text strokes that may sit just outside the snapped bound.
+            ex = max(2, int((x2 - x1) * 0.04))
+            ey = max(2, int((y2 - y1) * 0.04))
+            draw.rectangle(
+                [max(0, x1 - ex), max(0, y1 - ey),
+                 min(iw, x2 + ex), min(ih, y2 + ey)],
+                fill="white",
+            )
         w = x2 - x1
         h = y2 - y1
         text = b["text_zh"]
