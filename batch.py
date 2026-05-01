@@ -87,6 +87,7 @@ def default_config() -> dict:
         "recursive": False,
         "output_format": "PNG",
         "max_retries": 3,
+        "tile_mode": "split2+full",
     }
 
 
@@ -224,26 +225,90 @@ def _dedup_bubbles(bubbles: List[Dict], iou_thresh: float = 0.4,
     return kept
 
 
+def _sample_perimeter_brightness(
+    img_l: Image.Image, bbox: List[int], ring: int = 10
+) -> Tuple[float, float]:
+    """Sample the L-band brightness of a ring just OUTSIDE the bbox.
+
+    Vertical-text bubbles have low interior-white-ratio (text strokes dominate),
+    so an interior histogram check misclassifies them as 'not bubble'. The
+    perimeter ring is a more reliable signal — bubble exteriors are bright
+    even when the interior is text-heavy.
+
+    Returns (mean_brightness, fraction_pixels_above_220).
+    """
+    iw, ih = img_l.size
+    x1, y1, x2, y2 = bbox
+    ox1 = max(0, x1 - ring)
+    oy1 = max(0, y1 - ring)
+    ox2 = min(iw, x2 + ring)
+    oy2 = min(ih, y2 + ring)
+    if ox2 - ox1 < 4 or oy2 - oy1 < 4:
+        return 0.0, 0.0
+
+    # Build the 4 perimeter strips (top / bottom / left / right) and aggregate
+    # their histograms. PIL ops are C-level so this is ~10x faster than a
+    # per-pixel Python loop.
+    strips = []
+    if y1 > oy1:
+        strips.append(img_l.crop((ox1, oy1, ox2, y1)))
+    if y2 < oy2:
+        strips.append(img_l.crop((ox1, y2, ox2, oy2)))
+    if x1 > ox1:
+        strips.append(img_l.crop((ox1, y1, x1, y2)))
+    if x2 < ox2:
+        strips.append(img_l.crop((x2, y1, ox2, y2)))
+    if not strips:
+        return 0.0, 0.0
+
+    total = 0
+    bright = 0
+    sum_v = 0
+    for s in strips:
+        h = s.histogram()
+        for v, c in enumerate(h):
+            total += c
+            sum_v += v * c
+            if v >= 220:
+                bright += c
+    if total == 0:
+        return 0.0, 0.0
+    return sum_v / total, bright / total
+
+
 def detect_bubble_and_refine(
     orig_img: Image.Image,
     bbox: List[int],
     pad: int = 6,
-    white_thresh: int = 230,
-    white_ratio_min: float = 0.40,
     dark_thresh: int = 100,
 ) -> Tuple[bool, List[int]]:
-    """Snap Gemma's approximate bbox to the actual JP text region inside a bubble.
+    """Snap Gemma's approximate bbox to actual JP text and decide if we
+    should erase the original.
 
-    Strategy:
-    1. Crop a slightly expanded region around bbox.
-    2. Histogram check — if region is mostly white (≥ white_ratio_min),
-       it's a bubble interior. Otherwise it's SFX / free-form text on art.
-    3. For bubbles: threshold dark pixels (= JP text), erode 1px to drop
-       thin bubble borders, take getbbox() for tight text bound.
-    4. Sanity check refined bbox isn't wildly different from original.
+    Bubble detection (revised 2026-05-01 v3 — bimodality):
+    A real bubble has a bimodal interior histogram: many bright pixels
+    (white/off-white background, L ≥ 220) AND a meaningful chunk of dark
+    pixels (text strokes, L < 50). SFX on art has a flat mid-range
+    distribution. We sample the CENTER 70% of the bbox to avoid the bubble
+    border (drawn black outline that would otherwise dominate).
 
-    Returns (is_bubble, refined_bbox). is_bubble=True signals the caller
-    can also white-fill to erase the original JP text.
+    Decision (any-of):
+      A. Bimodal:    bright220 ≥ 0.30 AND dark50 ≥ 0.05
+      B. Very bright: bright220 ≥ 0.55  (catches small clean bubbles)
+
+    Diagnostic sweep on 302's 7 detected bubbles:
+      これこそ俺の理想 (big vert)  : br220=0.40 d50=0.23 → A ✓
+      ムカつく        (vert)     : br220=0.38 d50=0.14 → A ✓
+      クッソエロ       (SFX skin) : br220=0.22 d50=0.06 → reject ✓
+      そしてねにより    (vert)     : br220=0.38 d50=0.17 → A ✓
+      先輩に困る       (white)    : br220=0.61 d50=0.08 → B ✓
+      それがいい       (small)    : br220=0.73 d50=0.17 → A,B ✓
+
+    The previous "L ≥ 200 fraction ≥ 0.30 AND mean ≥ 170" heuristic
+    misclassified 4/7 vertical-text bubbles (text strokes pulled mean below
+    170). Bimodality is invariant to text density.
+
+    Returns (is_bubble, refined_bbox).
     """
     iw, ih = orig_img.size
     x1, y1, x2, y2 = bbox
@@ -254,19 +319,39 @@ def detect_bubble_and_refine(
     if cx2 - cx1 < 8 or cy2 - cy1 < 8:
         return False, bbox
 
-    crop = orig_img.crop((cx1, cy1, cx2, cy2)).convert("L")
-    hist = crop.histogram()
-    total = max(1, sum(hist))
-    white_ratio = sum(hist[white_thresh:]) / total
-    if white_ratio < white_ratio_min:
-        return False, bbox  # SFX or text on art — leave as-is
+    # Detection: sample the CENTER 70% of the bbox (inset by 15% each side).
+    # The bubble border is dark (drawn outline) and dominates the histogram
+    # if we include it; the interior tells us whether the background is
+    # bright (bubble) or dark/colored (SFX on art). Inset doesn't apply to
+    # tiny bboxes where 15% < 4 px.
+    bw = x2 - x1
+    bh = y2 - y1
+    inset_x = max(2, int(bw * 0.15))
+    inset_y = max(2, int(bh * 0.15))
+    ix1 = x1 + inset_x
+    iy1 = y1 + inset_y
+    ix2 = x2 - inset_x
+    iy2 = y2 - inset_y
+    if ix2 - ix1 < 4 or iy2 - iy1 < 4:
+        ix1, iy1, ix2, iy2 = x1, y1, x2, y2
 
+    inner = orig_img.crop((ix1, iy1, ix2, iy2)).convert("L")
+    hist = inner.histogram()
+    total = max(1, sum(hist))
+    bright_220 = sum(hist[220:]) / total
+    dark_50 = sum(hist[:50]) / total
+    is_bimodal = bright_220 >= 0.30 and dark_50 >= 0.05
+    is_very_bright = bright_220 >= 0.55
+    is_bubble = is_bimodal or is_very_bright
+    if not is_bubble:
+        return False, bbox
+
+    crop = orig_img.crop((cx1, cy1, cx2, cy2)).convert("L")
     dark_mask = crop.point(lambda v: 255 if v < dark_thresh else 0)
-    # Erode 1px to discard thin bubble border lines, keep thicker text strokes
     dark_mask = dark_mask.filter(ImageFilter.MinFilter(3))
     text_bbox = dark_mask.getbbox()
     if text_bbox is None:
-        return True, bbox  # bubble detected but no clear text — keep original
+        return True, bbox
 
     tx1, ty1, tx2, ty2 = text_bbox
     refined = [cx1 + tx1, cy1 + ty1, cx1 + tx2, cy1 + ty2]
@@ -274,7 +359,7 @@ def detect_bubble_and_refine(
     orig_area = max(1, (x2 - x1) * (y2 - y1))
     new_area = (refined[2] - refined[0]) * (refined[3] - refined[1])
     if new_area < orig_area * 0.15 or new_area > orig_area * 2.5:
-        return True, bbox  # refinement looks wrong; keep original but still erase
+        return True, bbox
     return True, refined
 
 
@@ -296,10 +381,12 @@ def render_bubbles_on_image(
         x1, y1, x2, y2 = render_bbox
 
         if is_bubble:
-            # Erase original JP text underneath. Expand fill 4% so we cover
-            # text strokes that may sit just outside the snapped bound.
-            ex = max(2, int((x2 - x1) * 0.04))
-            ey = max(2, int((y2 - y1) * 0.04))
+            # Erase original JP text underneath. Expand fill 8% so we cover
+            # text strokes (especially furigana, decorative dots) that may
+            # sit just outside the snapped bound. Capped at 18px each side
+            # to avoid spilling across panel borders for tight bboxes.
+            ex = min(18, max(3, int((x2 - x1) * 0.08)))
+            ey = min(18, max(3, int((y2 - y1) * 0.08)))
             draw.rectangle(
                 [max(0, x1 - ex), max(0, y1 - ey),
                  min(iw, x2 + ex), min(ih, y2 + ey)],
@@ -352,6 +439,279 @@ OLLAMA_PROMPT_TMPL = """日语漫画一页，尺寸 {w}×{h} 像素。
 
 **只**输出 JSON array（[ 开头 ] 结尾），无 markdown，无解释，无前后文字。
 没有日语文字时输出 []。忽略 UI：菜单、按钮、URL、时间戳、页码。"""
+
+
+def _choose_tile_grid(iw: int, ih: int, mode: str = "auto") -> List[Tuple[int, int, int, int]]:
+    """Decide how to split an image into tiles for identification.
+
+    Modes:
+      - "off"    : single tile (full image) — same as old behavior
+      - "split2" : 2 horizontal tiles with overlap (good for 2-page spreads)
+      - "grid2x2": 4 tiles with overlap (single page, dense panels)
+      - "spread4": 2 cols × 2 rows (2-page spread, very dense panels)
+      - "auto"   : aspect>1.4 → split2, aspect<=1.4 → grid2x2
+
+    Returns list of (x1, y1, x2, y2) crop rects in full-page pixels. Tiles
+    overlap so a bubble straddling a seam still gets seen whole by at least
+    one tile; cross-tile dedup runs at merge time.
+    """
+    aspect = iw / max(1, ih)
+    if mode == "auto":
+        mode = "split2" if aspect > 1.4 else "grid2x2"
+    if mode == "off":
+        return [(0, 0, iw, ih)]
+
+    overlap_x = int(iw * 0.06)
+    overlap_y = int(ih * 0.06)
+
+    if mode == "split2":
+        mid = iw // 2
+        return [
+            (0, 0, min(iw, mid + overlap_x), ih),
+            (max(0, mid - overlap_x), 0, iw, ih),
+        ]
+    if mode == "grid2x2":
+        mx = iw // 2
+        my = ih // 2
+        return [
+            (0, 0, min(iw, mx + overlap_x), min(ih, my + overlap_y)),
+            (max(0, mx - overlap_x), 0, iw, min(ih, my + overlap_y)),
+            (0, max(0, my - overlap_y), min(iw, mx + overlap_x), ih),
+            (max(0, mx - overlap_x), max(0, my - overlap_y), iw, ih),
+        ]
+    if mode == "spread4":
+        mx = iw // 2
+        my = ih // 2
+        return [
+            (0, 0, min(iw, mx + overlap_x), min(ih, my + overlap_y)),
+            (max(0, mx - overlap_x), 0, iw, min(ih, my + overlap_y)),
+            (0, max(0, my - overlap_y), min(iw, mx + overlap_x), ih),
+            (max(0, mx - overlap_x), max(0, my - overlap_y), iw, ih),
+        ]
+    return [(0, 0, iw, ih)]
+
+
+def _bbox_overlap_ratio(a: List[int], b: List[int]) -> float:
+    """min-overlap ratio: intersection / min(area_a, area_b).
+    Catches the case where a small bbox is contained inside a large one
+    (IoU low because union is dominated by the large one)."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / min(area_a, area_b)
+
+
+_PUNCT_CHARS = set("！？!?。、,.〜～…‥「」『』\"'·•・「」!?,.")
+
+
+def _jp_normalize(s: str) -> str:
+    """Strip whitespace; do NOT touch punctuation here (callers may want it)."""
+    return (s or "").replace("\n", "").replace(" ", "").strip()
+
+
+def _strip_jp_punct(s: str) -> str:
+    """Remove all punctuation chars for fuzzy compare. 'はぁ！？' → 'はぁ'."""
+    return "".join(c for c in s if c not in _PUNCT_CHARS)
+
+
+def _jp_similar(a: str, b: str) -> bool:
+    """Two JP texts likely point at the same bubble if any:
+      - exact-equal after punct strip & whitespace strip (catches
+        'はぁ！？' vs 'はぁ?')
+      - 4+ leading chars match exactly
+      - one is a prefix of the other (3+ chars), so a partial-tile read
+        merges into the full-bubble read
+      - 2+ leading chars match AND ≥70% positional match in first 6
+        (tolerates 1-char OCR drift like 時↔期)
+    """
+    a = _jp_normalize(a)
+    b = _jp_normalize(b)
+    if not a or not b:
+        return False
+    sa = _strip_jp_punct(a)
+    sb = _strip_jp_punct(b)
+    if sa and sb and sa == sb:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and a[:4] == b[:4]:
+        return True
+    short, long = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+    if len(short) >= 3 and long.startswith(short):
+        return True
+    n = min(6, len(a), len(b))
+    if n < 2:
+        return False
+    matches = sum(1 for i in range(n) if a[i] == b[i])
+    return matches / n >= 0.70 and matches >= 2
+
+
+def _bbox_center_dist(a: List[int], b: List[int]) -> float:
+    acx = (a[0] + a[2]) / 2
+    acy = (a[1] + a[3]) / 2
+    bcx = (b[0] + b[2]) / 2
+    bcy = (b[1] + b[3]) / 2
+    return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5
+
+
+def _aspect_score(bbox: List[int]) -> float:
+    """Manga vertical-text bubbles cluster around aspect 0.2-0.8 (taller than
+    wide). Wide flat bboxes (>3:1) are usually tile artifacts. Lower score
+    is better (more manga-typical)."""
+    w = max(1, bbox[2] - bbox[0])
+    h = max(1, bbox[3] - bbox[1])
+    aspect = w / h
+    if aspect > 3.0:
+        return 3.0  # penalize wide-flat artifacts
+    return abs(aspect - 0.5)
+
+
+def _merge_tile_bubbles(
+    bubbles: List[Dict], iou_thresh: float = 0.30,
+    contain_thresh: float = 0.55,
+) -> List[Dict]:
+    """Cross-tile / cross-pass dedup.
+
+    Signals (any one triggers dedup):
+      1. IoU > 0.30: classic spatial overlap.
+      2. Min-area-overlap > 0.55: smaller mostly inside larger (catches
+         OCR variants on the same bubble like 精鋭課/搾精課).
+      3. JP fuzzy match + center distance heuristic.
+      4. Short-text proximity: when both texts are ≤2 stripped chars or
+         both punctuation-only, treat as same-bubble OCR drift if
+         centers are close (catches 夏日/翌日 and ?/? on same bubble).
+
+    Sort order: longer JP first (more complete capture), then more
+    manga-typical aspect.
+    """
+    if not bubbles:
+        return bubbles
+    sorted_b = sorted(
+        bubbles,
+        key=lambda b: (-len(b.get("text_jp", "")), _aspect_score(b["bbox"])),
+    )
+    kept: List[Dict] = []
+    for b in sorted_b:
+        is_dup = False
+        for k in kept:
+            # Spatial overlap signals (per-tile artifacts)
+            if _bbox_iou(b["bbox"], k["bbox"]) > iou_thresh:
+                is_dup = True
+                break
+            if _bbox_overlap_ratio(b["bbox"], k["bbox"]) > contain_thresh:
+                is_dup = True
+                break
+            # Same/near-same JP text + nearby spatial position. Distance
+            # threshold scales loosely with the larger bbox dimension to
+            # catch cases where one tile saw a tighter crop than another.
+            if _jp_similar(b.get("text_jp", ""), k.get("text_jp", "")):
+                kw = k["bbox"][2] - k["bbox"][0]
+                kh = k["bbox"][3] - k["bbox"][1]
+                limit = max(350, max(kw, kh) // 2)
+                if _bbox_center_dist(b["bbox"], k["bbox"]) < limit:
+                    is_dup = True
+                    break
+            # Short-text / punct-only proximity rule. Vertical 2-char
+            # bubbles (夏日/翌日) and reaction-mark bubbles (?/?) often
+            # come back with different OCR per pass yet point at the
+            # same physical bubble. Use bbox geometry rather than text.
+            sa = _strip_jp_punct(_jp_normalize(b.get("text_jp", "")))
+            sb = _strip_jp_punct(_jp_normalize(k.get("text_jp", "")))
+            both_short = len(sa) <= 2 and len(sb) <= 2
+            both_punct = not sa and not sb
+            if both_short or both_punct:
+                bw = b["bbox"][2] - b["bbox"][0]
+                bh = b["bbox"][3] - b["bbox"][1]
+                kw = k["bbox"][2] - k["bbox"][0]
+                kh = k["bbox"][3] - k["bbox"][1]
+                smaller_max_dim = min(max(bw, bh), max(kw, kh))
+                limit = max(120, int(1.8 * smaller_max_dim))
+                if _bbox_center_dist(b["bbox"], k["bbox"]) < limit:
+                    is_dup = True
+                    break
+        if not is_dup:
+            kept.append(b)
+    return kept
+
+
+def call_ollama_tiled(
+    img: Image.Image,
+    cfg: dict,
+    max_retries: int,
+    tile_mode: str = "auto",
+) -> Tuple[List[Dict], int, int]:
+    """Tile-based identification wrapper.
+
+    Splits the page into 2-4 overlapping tiles, runs `call_ollama` per tile,
+    translates each tile's bboxes back to full-page pixels, then dedups
+    overlapping detections. Catches small bubbles a single full-page call
+    misses (Gemma's vision attention dilutes on 2560×1271 spreads).
+
+    Modes (see _choose_tile_grid):
+      off, split2, grid2x2, spread4, auto
+    Plus combined modes:
+      split2+full   — full-page pass + 2 horizontal tiles, dedup
+      grid2x2+full  — full-page pass + 2x2 tiles, dedup
+
+    Cost: N× wall-clock vs single call (Ollama serializes), N× tokens.
+    Sean explicitly authorized ≤2min/page for quality (2026-05-01).
+    """
+    iw, ih = img.size
+
+    # Combined modes: full-page pass first (captures global context +
+    # broad coverage), then a tiled pass (catches details a full-page
+    # missed). Dedup picks the longer-JP version of any duplicate.
+    do_full = False
+    grid_mode = tile_mode
+    if tile_mode.endswith("+full"):
+        do_full = True
+        grid_mode = tile_mode[:-len("+full")]
+
+    tiles = _choose_tile_grid(iw, ih, grid_mode)
+    if not do_full and len(tiles) == 1:
+        return call_ollama(img, cfg, max_retries)
+
+    all_bubbles: List[Dict] = []
+    total_in = 0
+    total_out = 0
+    pass_count = 0
+
+    if do_full:
+        try:
+            bubbles, in_tok, out_tok = call_ollama(img, cfg, max_retries)
+            all_bubbles.extend(bubbles)
+            total_in += in_tok
+            total_out += out_tok
+            pass_count += 1
+        except Exception:
+            pass
+
+    for (tx1, ty1, tx2, ty2) in tiles:
+        crop = img.crop((tx1, ty1, tx2, ty2))
+        try:
+            bubbles, in_tok, out_tok = call_ollama(crop, cfg, max_retries)
+        except Exception:
+            continue
+        total_in += in_tok
+        total_out += out_tok
+        pass_count += 1
+        for b in bubbles:
+            x1, y1, x2, y2 = b["bbox"]
+            b["bbox"] = [
+                int(x1) + tx1, int(y1) + ty1,
+                int(x2) + tx1, int(y2) + ty1,
+            ]
+            all_bubbles.append(b)
+
+    if pass_count == 0:
+        # Every pass failed — fall back to the standard call so the caller
+        # gets the original error.
+        return call_ollama(img, cfg, max_retries)
+
+    merged = _merge_tile_bubbles(all_bubbles)
+    return merged, total_in, total_out
 
 
 def call_ollama(
@@ -727,7 +1087,12 @@ class BatchWorker(QObject):
 
             try:
                 if backend == "ollama":
-                    bubbles, in_tok, out_tok = call_ollama(img, self.cfg, retries)
+                    tile_mode = self.cfg.get("tile_mode", "off")
+                    if tile_mode and tile_mode != "off":
+                        bubbles, in_tok, out_tok = call_ollama_tiled(
+                            img, self.cfg, retries, tile_mode=tile_mode)
+                    else:
+                        bubbles, in_tok, out_tok = call_ollama(img, self.cfg, retries)
                 else:
                     bubbles, in_tok, out_tok = call_claude(client, img, model, retries)
             except APIStatusError as e:
@@ -994,6 +1359,9 @@ class BatchWindow(QMainWindow):
         self.format_combo = QComboBox()
         self.format_combo.addItems(["PNG", "JPEG"])
         f3.addRow("Output format (PNG lossless, JPEG smaller)", self.format_combo)
+        self.tile_combo = QComboBox()
+        self.tile_combo.addItems(["off", "split2+full", "split2", "grid2x2+full", "grid2x2", "spread4", "auto"])
+        f3.addRow("Tile mode (split2+full = best for spreads, slower)", self.tile_combo)
         g3.setLayout(f3)
         root.addWidget(g3)
 
@@ -1062,6 +1430,7 @@ class BatchWindow(QMainWindow):
         self.conc_spin.setValue(self.cfg.get("concurrency", 3))
         self.retry_spin.setValue(self.cfg.get("max_retries", 3))
         self.format_combo.setCurrentText(self.cfg.get("output_format", "PNG"))
+        self.tile_combo.setCurrentText(self.cfg.get("tile_mode", "split2+full"))
         self._update_backend_visibility()
 
     def _pull_ui_to_cfg(self) -> None:
@@ -1078,6 +1447,7 @@ class BatchWindow(QMainWindow):
         self.cfg["concurrency"] = self.conc_spin.value()
         self.cfg["max_retries"] = self.retry_spin.value()
         self.cfg["output_format"] = self.format_combo.currentText()
+        self.cfg["tile_mode"] = self.tile_combo.currentText()
         save_config(self.cfg)
 
     def _update_backend_visibility(self) -> None:
