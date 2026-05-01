@@ -377,21 +377,15 @@ def render_bubbles_on_image(
         key=lambda b: -((b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1])),
     )
     for b in sorted_b:
-        is_bubble, render_bbox = detect_bubble_and_refine(img, b["bbox"])
+        # We still call detect_bubble_and_refine to snap bbox to text
+        # content (Gemma's bbox can be loose), so the translation centers
+        # on the actual JP text rather than empty bubble space. We do NOT
+        # paint a white rectangle — Sean's verdict (2026-05-01) is that
+        # white-fill tends to bleed past the speech bubble onto art, and
+        # the stroke outline below already keeps text readable when it
+        # overlaps the original.
+        _, render_bbox = detect_bubble_and_refine(img, b["bbox"])
         x1, y1, x2, y2 = render_bbox
-
-        if is_bubble:
-            # Erase original JP text underneath. Expand fill 8% so we cover
-            # text strokes (especially furigana, decorative dots) that may
-            # sit just outside the snapped bound. Capped at 18px each side
-            # to avoid spilling across panel borders for tight bboxes.
-            ex = min(18, max(3, int((x2 - x1) * 0.08)))
-            ey = min(18, max(3, int((y2 - y1) * 0.08)))
-            draw.rectangle(
-                [max(0, x1 - ex), max(0, y1 - ey),
-                 min(iw, x2 + ex), min(ih, y2 + ey)],
-                fill="white",
-            )
         w = x2 - x1
         h = y2 - y1
         text = b["text_zh"]
