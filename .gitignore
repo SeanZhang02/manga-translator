@@ -26,3 +26,6 @@ desktop.ini
 output/
 translated/
 *.log
+
+# Local test harness outputs (large PNGs, not for git)
+test_outputs/
