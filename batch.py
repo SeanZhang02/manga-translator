@@ -182,7 +182,46 @@ def sanitize_bubbles(bubbles, img_size) -> List[Dict]:
             "text_zh": txt.strip(),
             "bbox": [int(x1), int(y1), int(x2), int(y2)],
         })
-    return clean
+    return _dedup_bubbles(clean)
+
+
+def _bbox_iou(a: List[int], b: List[int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _dedup_bubbles(bubbles: List[Dict], iou_thresh: float = 0.4,
+                   max_repeats: int = 2) -> List[Dict]:
+    """Two-stage dedup against Gemma's degenerate-output failure modes:
+
+    1. Repetition collapse: if the same text_zh appears > max_repeats times
+       on one page, the model is likely in a repeat loop ('前野/前野/前野...');
+       keep only the first max_repeats occurrences.
+    2. Duplicate bboxes: same text + IoU > iou_thresh = redundant; keep first.
+    """
+    from collections import Counter
+    counts = Counter(b["text_zh"] for b in bubbles)
+    seen = {}
+    stage1 = []
+    for b in bubbles:
+        t = b["text_zh"]
+        if counts[t] > max_repeats:
+            seen[t] = seen.get(t, 0) + 1
+            if seen[t] > max_repeats:
+                continue
+        stage1.append(b)
+    kept: List[Dict] = []
+    for b in stage1:
+        if any(b["text_zh"] == k["text_zh"] and _bbox_iou(b["bbox"], k["bbox"]) > iou_thresh
+               for k in kept):
+            continue
+        kept.append(b)
+    return kept
 
 
 def render_bubbles_on_image(
@@ -231,35 +270,21 @@ def render_bubbles_on_image(
 
 OLLAMA_PROMPT_TMPL = """日语漫画一页，尺寸 {w}×{h} 像素。
 
-【扫描策略 — 按画格 (panel) 逐格扫】
-密集排版页常漏检小气泡 / 拟声词 / 单字感叹。请按以下顺序：
-1. 先在脑中切分出所有画格 (panel)，从左上画格开始按 Z 字阅读顺序
-2. 进入每一格后，列出该格内**所有**含日语文字的区域，再进下一格
-3. 宁多勿漏 — 不确定是否含字的区域也输出
+识别每个含日语文字的区域（对话气泡、旁白框、拟声词、招牌、标签等），输出 JSON array。
+密集排版时按画格 (panel) 从左上到右下 Z 形逐格扫描，每格内列完所有文字再进下一格。
 
-【必须捕获的文字类型】
-- 对话气泡（圆 / 椭圆 / 任意外形）
-- 旁白方框 / 旁注
-- 拟声词（手写装饰字体；ドキドキ / バタン / ガチャ / ドン 等）
-- 思考气泡（虚线边、云朵形）
-- 招牌、标签、写在背景里的文字
-- 单字感叹（だが / えっ / ？！/ ハッ 等）
-- 画格夹缝里的小字
+每项：
+- "text_jp": 日语原文（竖排 = 自上而下、右列先；kanji+furigana 合并；忽略 furigana 小假名）
+- "text_zh": 自然流畅的中文翻译（拟声词翻拟声词：ドキドキ→怦怦 / バタン→砰）
+- "box_2d": [x1, y1, x2, y2]，**归一化 0-1000**（图像左上=0,0，右下=1000,1000），紧贴文字视觉边界
 
-【每项输出字段】
-- "text_jp": 日语原文（竖排 = 自上而下、右列先读；kanji+furigana 合并一项；忽略 furigana 小假名）
-- "text_zh": 自然流畅的中文翻译（拟声词译拟声词：ドキドキ→怦怦 / バタン→砰 / ガチャ→咔嚓 / ドン→咚）
-- "box_2d": [x1, y1, x2, y2]，坐标**归一化到 0-1000**（图像左上=0,0，右下=1000,1000）
+【硬规则】
+- 同一段文字**只输出一次**，禁止为同一文字输出多个 bbox
+- **不要识别**衣服花纹、装饰图案、光影效果、模糊远景、画面装饰元素 — 只识别明确的日语文字
+- 下半页文字 y 必须 > 500，不要把下格 bbox 错放到上格
 
-【bbox 关键约束】
-- 紧贴**文字本身**的视觉边界，**不是**整个气泡或整个画格
-- 多行竖排文字 = 整列宽度 × 整列高度（不要拆成单字）
-- 上下分栏的两段竖排 = 输出两个独立 box
-- 密集排版尤其核对 y 坐标：下半页文字的 y 必须 > 500，不要把下格 bbox 错画到上格
-- 严禁超出 0-1000 范围
-
-**只**输出 JSON array（[ 开头 ] 结尾），无 markdown 代码块，无解释，无前后文字。
-没有日语文字时输出 []。忽略 UI 元素：菜单、按钮、URL、时间戳、页码。"""
+**只**输出 JSON array（[ 开头 ] 结尾），无 markdown，无解释，无前后文字。
+没有日语文字时输出 []。忽略 UI：菜单、按钮、URL、时间戳、页码。"""
 
 
 def call_ollama(
@@ -301,7 +326,7 @@ def call_ollama(
                                  # the 6000-token budget is eaten by reasoning and
                                  # `response` comes back empty. Disable to go
                                  # straight to JSON output.
-                "options": {"temperature": 0.1, "num_predict": 6000},
+                "options": {"temperature": 0.2, "num_predict": 6000},
             }
             req = urllib.request.Request(
                 url,
